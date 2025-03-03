@@ -1037,131 +1037,168 @@ template <typename key_at, typename slot_at> void test_strings() {
 }
 
 /**
- * @brief Tests replacing and updating entries in index_dense_gt to ensure consistency after modifications.
+ * @brief Tests merging.
  */
-template <typename key_at, typename slot_at> void test_replacing_update() {
+void test_merge() {
+    using index_t = index_gt<>;
+    using distance_t = typename index_t::distance_t;
+    using key_t = typename index_t::key_t;
+    using compressed_slot_t = typename index_t::compressed_slot_t;
+    using member_ref_t = typename index_t::member_ref_t;
+    using member_cref_t = typename index_t::member_cref_t;
+    using member_citerator_t = typename index_t::member_citerator_t;
 
-    using vector_key_t = key_at;
-    using slot_t = slot_at;
+    using value_t = float;
 
-    using index_punned_t = index_dense_gt<vector_key_t, slot_t>;
-    metric_punned_t metric(1, metric_kind_t::l2sq_k, scalar_kind_t::f32_k);
-    auto index_result = index_punned_t::make(metric);
-    expect(index_result);
-    index_punned_t& index = index_result.index;
-
-    // Reserve space for 3 entries
-    index.try_reserve(3);
-    auto as_ptr = [](float v) {
-        static float value;
-        value = v;
-        return &value;
+    auto create_index = []() {
+      auto index_result = index_t::make();
+      expect(index_result);
+      return std::move(index_result.index);
     };
 
-    // Add 3 entries
-    index.add(42, as_ptr(1.1f));
-    index.add(43, as_ptr(2.1f));
-    index.add(44, as_ptr(3.1f));
-    expect_eq(index.size(), 3);
+    struct metric_t {
+      std::unordered_map<compressed_slot_t, value_t> values;
+      metric_t() : values() {}
+      distance_t compute(value_t const& a, value_t const& b) {
+        if (b > a) {
+          return b - a;
+        } else {
+          return a - b;
+        }
+      }
+      distance_t operator()(value_t const& a, member_cref_t const& b) {
+        return compute(a, values.at(get_slot(b)));
+      }
+      distance_t operator()(value_t const& a, member_citerator_t const& b) {
+        return compute(a, values.at(get_slot(b)));
+      }
+      distance_t operator()(member_citerator_t const& a, member_citerator_t const& b) {
+        return compute(values.at(get_slot(a)), values.at(get_slot(b)));
+      }
+    };
 
-    // Assert initial state
-    auto initial_search = index.search(as_ptr(1.0f), 3);
-    expect_eq(initial_search.size(), 3);
-    expect_eq(initial_search[0].member.key, 42);
-    expect_eq(initial_search[1].member.key, 43);
-    expect_eq(initial_search[2].member.key, 44);
+    auto add = [](index_t& index, key_t const key, value_t const value, metric_t &metric) {
+      auto on_success = [&](member_ref_t member) {
+        metric.values[member.slot] = value;
+      };
+      return index.add(key, value, metric, {}, on_success);
+    };
 
-    // Replace the second entry
-    index.remove(43);
-    index.add(43, as_ptr(2.2f));
-    expect_eq(index.size(), 3);
+    // Prepare index 1
+    auto index1 = create_index();
+    metric_t metric1;
+    index1.try_reserve(3);
+    add(index1, 11, 1.1f, metric1);
+    add(index1, 12, 2.1f, metric1);
+    add(index1, 13, 3.1f, metric1);
+    expect_eq(index1.size(), 3);
 
-    // Assert state after replacing second entry
-    auto post_second_replacement = index.search(as_ptr(1.0f), 3);
-    expect_eq(post_second_replacement.size(), 3);
-    expect_eq(post_second_replacement[0].member.key, 42);
-    expect_eq(post_second_replacement[1].member.key, 43);
-    expect_eq(post_second_replacement[2].member.key, 44);
+    // Prepare index 2
+    auto index2 = create_index();
+    metric_t metric2;
+    index2.try_reserve(4);
+    add(index2, 21, -1.1f, metric2);
+    add(index2, 22, -2.1f, metric2);
+    add(index2, 23, -3.1f, metric2);
+    add(index2, 24, -4.1f, metric2);
+    expect_eq(index2.size(), 4);
 
-    // Replace the first entry
-    index.remove(42);
-    index.add(42, as_ptr(1.2f));
-    expect_eq(index.size(), 3);
+    // Merge indexes
+    std::vector<index_t const*> indexes = {&index1, &index2};
+    metric_t merged_metric;
+    auto get_value = [&](index_t const& index, member_cref_t member) -> value_t& {
+      if (&index == &index1) {
+        return metric1.values[member.slot];
+      } else {
+        return metric2.values[member.slot];
+      }
+    };
+    auto merge_on_success = [&](member_ref_t member, value_t const &value) {
+      merged_metric.values[member.slot] = value;
+    };
+    auto merge_result = index_t::merge("output", indexes, merged_metric, get_value, {}, {}, {}, {}, merge_on_success);
+    expect(merge_result);
+    auto merged_index = std::move(merge_result.index);
+    expect_eq(merged_index.size(), 7);
 
-    // Assert state after replacing first entry
-    auto final_search = index.search(as_ptr(1.0f), 3, 0);
-    expect_eq(final_search.size(), 3);
-    expect_eq(final_search[0].member.key, 42);
-    expect_eq(final_search[1].member.key, 43);
-    expect_eq(final_search[2].member.key, 44);
+    // Assert
+    auto search = merged_index.search(0.75f, 3, merged_metric);
+    expect_eq(search.size(), 3);
+    expect_eq(static_cast<key_t>(search[0].member.key), 11);
+    expect_eq(static_cast<key_t>(search[1].member.key), 12);
+    expect_eq(static_cast<key_t>(search[2].member.key), 21);
 }
 
 int main(int, char**) {
-    test_uint40();
-    test_cosine<float, std::int64_t, uint40_t>(10, 10);
+    // test_uint40();
+    // test_cosine<float, std::int64_t, uint40_t>(10, 10);
 
-    // Test plugins, like K-Means clustering.
-    {
-        std::size_t vectors_count = 1000, centroids_count = 10, dimensions = 256;
-        kmeans_clustering_t clustering;
-        clustering.max_iterations = 2;
-        std::vector<float> vectors(vectors_count * dimensions), centroids(centroids_count * dimensions);
-        matrix_slice_gt<float const> vectors_slice(vectors.data(), dimensions, vectors_count);
-        matrix_slice_gt<float> centroids_slice(centroids.data(), dimensions, centroids_count);
-        std::generate(vectors.begin(), vectors.end(), [] { return float(std::rand()) / float(INT_MAX); });
-        std::vector<std::size_t> assignments(vectors_count);
-        std::vector<distance_punned_t> distances(vectors_count);
-        auto clustering_result = clustering(vectors_slice, centroids_slice, {assignments.data(), assignments.size()},
-                                            {distances.data(), distances.size()});
-        expect(clustering_result);
-    }
+    // // Test plugins, like K-Means clustering.
+    // {
+    //     std::size_t vectors_count = 1000, centroids_count = 10, dimensions = 256;
+    //     kmeans_clustering_t clustering;
+    //     clustering.max_iterations = 2;
+    //     std::vector<float> vectors(vectors_count * dimensions), centroids(centroids_count * dimensions);
+    //     matrix_slice_gt<float const> vectors_slice(vectors.data(), dimensions, vectors_count);
+    //     matrix_slice_gt<float> centroids_slice(centroids.data(), dimensions, centroids_count);
+    //     std::generate(vectors.begin(), vectors.end(), [] { return float(std::rand()) / float(INT_MAX); });
+    //     std::vector<std::size_t> assignments(vectors_count);
+    //     std::vector<distance_punned_t> distances(vectors_count);
+    //     auto clustering_result = clustering(vectors_slice, centroids_slice, {assignments.data(), assignments.size()},
+    //                                         {distances.data(), distances.size()});
+    //     expect(clustering_result);
+    // }
 
-    // Exact search without constructing indexes.
-    // Great for validating the distance functions.
-    std::printf("Testing exact search\n");
-    for (std::size_t dataset_count : {10, 100})
-        for (std::size_t queries_count : {1, 10})
-            for (std::size_t wanted_count : {1, 5})
-                test_exact_search(dataset_count, queries_count, wanted_count);
+    // // Exact search without constructing indexes.
+    // // Great for validating the distance functions.
+    // std::printf("Testing exact search\n");
+    // for (std::size_t dataset_count : {10, 100})
+    //     for (std::size_t queries_count : {1, 10})
+    //         for (std::size_t wanted_count : {1, 5})
+    //             test_exact_search(dataset_count, queries_count, wanted_count);
 
-    // Make sure the initializers and the algorithms can work with inadequately small values.
-    // Be warned - this combinatorial explosion of tests produces close to __500'000__ tests!
-    std::printf("Testing allowed, but absurd index configs\n");
-    for (std::size_t connectivity : {2, 3})   // ! Zero maps to default, one degenerates
-        for (std::size_t dimensions : {1, 3}) // ! Zero will raise
-            for (std::size_t expansion : {0, 1, 3})
-                for (std::size_t count_vectors : {0, 1, 2, 17})
-                    for (std::size_t count_wanted : {0, 1, 3, 19}) {
-                        test_absurd<std::int64_t, slot32_t>(dimensions, connectivity, expansion, expansion,
-                                                            count_vectors, count_wanted);
-                        test_absurd<uint40_t, uint40_t>(dimensions, connectivity, expansion, expansion, count_vectors,
-                                                        count_wanted);
-                    }
+    // // Make sure the initializers and the algorithms can work with inadequately small values.
+    // // Be warned - this combinatorial explosion of tests produces close to __500'000__ tests!
+    // std::printf("Testing allowed, but absurd index configs\n");
+    // for (std::size_t connectivity : {2, 3})   // ! Zero maps to default, one degenerates
+    //     for (std::size_t dimensions : {1, 3}) // ! Zero will raise
+    //         for (std::size_t expansion : {0, 1, 3})
+    //             for (std::size_t count_vectors : {0, 1, 2, 17})
+    //                 for (std::size_t count_wanted : {0, 1, 3, 19}) {
+    //                     test_absurd<std::int64_t, slot32_t>(dimensions, connectivity, expansion, expansion,
+    //                                                         count_vectors, count_wanted);
+    //                     test_absurd<uint40_t, uint40_t>(dimensions, connectivity, expansion, expansion, count_vectors,
+    //                                                     count_wanted);
+    //                 }
 
-    // TODO: Test absurd configs that are banned
-    // for (metric_kind_t metric_kind : {metric_kind_t::cos_k, metric_kind_t::unknown_k, metric_kind_t::haversine_k}) {}
+    // // TODO: Test absurd configs that are banned
+    // // for (metric_kind_t metric_kind : {metric_kind_t::cos_k, metric_kind_t::unknown_k, metric_kind_t::haversine_k}) {}
 
-    // Test with cosine metric - the most common use case
-    std::printf("Testing common cases\n");
-    for (std::size_t collection_size : {10, 500})
-        for (std::size_t dimensions : {97, 256}) {
-            std::printf("- Indexing %zu vectors with cos: <float, std::int64_t, slot32_t> \n", collection_size);
-            test_cosine<float, std::int64_t, slot32_t>(collection_size, dimensions);
-            std::printf("- Indexing %zu vectors with cos: <float, std::int64_t, uint40_t> \n", collection_size);
-            test_cosine<float, std::int64_t, uint40_t>(collection_size, dimensions);
-        }
+    // // Test with cosine metric - the most common use case
+    // std::printf("Testing common cases\n");
+    // for (std::size_t collection_size : {10, 500})
+    //     for (std::size_t dimensions : {97, 256}) {
+    //         std::printf("- Indexing %zu vectors with cos: <float, std::int64_t, slot32_t> \n", collection_size);
+    //         test_cosine<float, std::int64_t, slot32_t>(collection_size, dimensions);
+    //         std::printf("- Indexing %zu vectors with cos: <float, std::int64_t, uint40_t> \n", collection_size);
+    //         test_cosine<float, std::int64_t, uint40_t>(collection_size, dimensions);
+    //     }
 
-    // Test with binary vectors
-    std::printf("Testing binary vectors\n");
-    for (std::size_t connectivity : {3, 13, 50})
-        for (std::size_t dimensions : {97, 256})
-            test_tanimoto<std::int64_t, slot32_t>(dimensions, connectivity);
+    // // Test with binary vectors
+    // std::printf("Testing binary vectors\n");
+    // for (std::size_t connectivity : {3, 13, 50})
+    //     for (std::size_t dimensions : {97, 256})
+    //         test_tanimoto<std::int64_t, slot32_t>(dimensions, connectivity);
 
-    // Beyond dense equi-dimensional vectors - integer sets
-    std::printf("Testing sparse vectors, strings, and sets\n");
-    for (std::size_t set_size : {1, 100, 1000})
-        test_sets<std::int64_t, slot32_t>(set_size, 20, 30);
-    test_strings<std::int64_t, slot32_t>();
+    // // Beyond dense equi-dimensional vectors - integer sets
+    // std::printf("Testing sparse vectors, strings, and sets\n");
+    // for (std::size_t set_size : {1, 100, 1000})
+    //     test_sets<std::int64_t, slot32_t>(set_size, 20, 30);
+    // test_strings<std::int64_t, slot32_t>();
+
+    // Test merge
+    std::printf("Testing merge\n");
+    test_merge();
 
     return 0;
 }

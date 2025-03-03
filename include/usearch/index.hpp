@@ -85,18 +85,20 @@
 #endif
 
 // STL includes
-#include <algorithm> // `std::sort_heap`
-#include <atomic>    // `std::atomic`
-#include <bitset>    // `std::bitset`
-#include <climits>   // `CHAR_BIT`
-#include <cmath>     // `std::sqrt`
-#include <cstring>   // `std::memset`
-#include <iterator>  // `std::reverse_iterator`
-#include <mutex>     // `std::unique_lock` - replacement candidate
-#include <random>    // `std::default_random_engine` - replacement candidate
-#include <stdexcept> // `std::runtime_exception`
-#include <thread>    // `std::thread`
-#include <utility>   // `std::pair`
+#include <algorithm>  // `std::sort_heap`
+#include <atomic>     // `std::atomic`
+#include <bitset>     // `std::bitset`
+#include <climits>    // `CHAR_BIT`
+#include <cmath>      // `std::sqrt`
+#include <cstring>    // `std::memset`
+#include <filesystem> // `std::filesystem`
+#include <fstream>    // `std::ofstream`
+#include <iterator>   // `std::reverse_iterator`
+#include <mutex>      // `std::unique_lock` - replacement candidate
+#include <random>     // `std::default_random_engine` - replacement candidate
+#include <stdexcept>  // `std::runtime_exception`
+#include <thread>     // `std::thread`
+#include <utility>    // `std::pair`
 
 // Helper macros for concatenation and stringification
 #define usearch_concat_helper_m(a, b) a##b
@@ -1492,6 +1494,17 @@ struct dummy_callback_t {
 };
 
 /**
+ *  @brief  An example of what a USearch-compatible ad-hoc operation on in-flight entries.
+ *
+ *  This kind of callbacks is used when the engine is being updated and you want to patch
+ *  the entries, while their are still under locks - limiting concurrent access and providing
+ *  consistency.
+ */
+struct dummy_merge_callback_t {
+  template <typename member_at, typename value_at> void operator()(member_at&&, value_at&&) const noexcept {}
+};
+
+/**
  *  @brief  An example of what a USearch-compatible progress-bar should look like.
  *
  *  This is particularly helpful when handling long-running tasks, like serialization,
@@ -1723,6 +1736,7 @@ class memory_mapped_file_t {
     char const* path_{}; /**< The path to the file to be memory-mapped. */
     void* ptr_{};        /**< A pointer to the memory-mapping. */
     size_t length_{};    /**< The length of the memory-mapped file in bytes. */
+    bool is_writable_{false}; /**< Whether the memory-mapped file is writable or not. */
 
 #if defined(USEARCH_DEFINED_WINDOWS)
     HANDLE file_handle_{};    /**< The file handle on Windows. */
@@ -1736,13 +1750,15 @@ class memory_mapped_file_t {
     byte_t* data() noexcept { return reinterpret_cast<byte_t*>(ptr_); }
     byte_t const* data() const noexcept { return reinterpret_cast<byte_t const*>(ptr_); }
     std::size_t size() const noexcept { return static_cast<std::size_t>(length_); }
+    bool is_writable() const noexcept { return !is_writable_; }
 
     memory_mapped_file_t() noexcept {}
-    memory_mapped_file_t(char const* path) noexcept : path_(path) {}
+    memory_mapped_file_t(char const* path, bool is_writable = false) noexcept : path_(path), is_writable_(is_writable) {}
     ~memory_mapped_file_t() noexcept { close(); }
     memory_mapped_file_t(memory_mapped_file_t&& other) noexcept
         : path_(exchange(other.path_, nullptr)), ptr_(exchange(other.ptr_, nullptr)),
           length_(exchange(other.length_, 0)),
+          is_writable_(other.is_writable_),
 #if defined(USEARCH_DEFINED_WINDOWS)
           file_handle_(exchange(other.file_handle_, nullptr)), mapping_handle_(exchange(other.mapping_handle_, nullptr))
 #else
@@ -1773,19 +1789,31 @@ class memory_mapped_file_t {
 
 #if defined(USEARCH_DEFINED_WINDOWS)
 
+        DWARD file_desired_access = GENERIC_READ;
+        DWARD share_mode = FILE_SHARE_READ;
+        DWORD creation_disposition = OPEN_EXISTING;
+        if (is_writable_) {
+            file_desired_access |= GENERIC_WRITE;
+            share_mode |= FILE_SHARE_WRITE;
+        }
         HANDLE file_handle =
-            CreateFile(path_, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+            CreateFile(path_, file_desired_access, share_mode, 0, creation_disposition, FILE_ATTRIBUTE_NORMAL, 0);
         if (file_handle == INVALID_HANDLE_VALUE)
             return result.failed("Opening file failed!");
 
         std::size_t file_length = GetFileSize(file_handle, 0);
-        HANDLE mapping_handle = CreateFileMapping(file_handle, 0, PAGE_READONLY, 0, 0, 0);
+        DWORD protect = is_writable_ ? PAGE_READWRITE: PAGE_READONLY;
+        HANDLE mapping_handle = CreateFileMapping(file_handle, 0, protect, 0, 0, 0);
         if (mapping_handle == 0) {
             CloseHandle(file_handle);
             return result.failed("Mapping file failed!");
         }
 
-        byte_t* file = (byte_t*)MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, file_length);
+        DWORD map_desired_access = FILE_MAP_READ;
+        if (is_writable_) {
+          map_desired_access |= FILE_MAP_WRITE;
+        }
+        byte_t* file = (byte_t*)MapViewOfFile(mapping_handle, map_desired_access, 0, 0, file_length);
         if (file == 0) {
             CloseHandle(mapping_handle);
             CloseHandle(file_handle);
@@ -1797,11 +1825,11 @@ class memory_mapped_file_t {
         length_ = file_length;
 #else
 
+        int open_flags = is_writable_ ? O_RDWR : O_RDONLY;
 #if defined(USEARCH_DEFINED_LINUX)
-        int descriptor = open(path_, O_RDONLY | O_NOATIME);
-#else
-        int descriptor = open(path_, O_RDONLY);
+        open_flags |= O_NOATIME;
 #endif
+        int descriptor = open(path_, open_flags);
         if (descriptor < 0)
             return result.failed(std::strerror(errno));
 
@@ -1814,7 +1842,10 @@ class memory_mapped_file_t {
         }
 
         // Map the entire file
-        byte_t* file = (byte_t*)mmap(NULL, file_stat.st_size, PROT_READ, MAP_SHARED, descriptor, 0);
+        int map_prot = PROT_READ;
+        if (is_writable_)
+          map_prot |= PROT_WRITE;
+        byte_t* file = (byte_t*)mmap(NULL, file_stat.st_size, map_prot, MAP_SHARED, descriptor, 0);
         if (file == MAP_FAILED) {
             ::close(descriptor);
             return result.failed(std::strerror(errno));
@@ -2243,7 +2274,8 @@ class index_gt {
     tape_allocator_t tape_allocator_{};
 
     precomputed_constants_t pre_{};
-    memory_mapped_file_t viewed_file_{};
+    memory_mapped_file_t mapped_file_{};
+    bool is_mutable_{true};
 
     /// @brief  Controls access to `max_level_` and `entry_slot_`.
     ///         If any thread is updating those values, no other threads can `add()` or `search()`.
@@ -2275,7 +2307,7 @@ class index_gt {
     std::size_t max_level() const noexcept { return nodes_count_ ? static_cast<std::size_t>(max_level_) : 0; }
     index_config_t const& config() const noexcept { return config_; }
     index_limits_t const& limits() const noexcept { return limits_; }
-    bool is_immutable() const noexcept { return bool(viewed_file_); }
+    bool is_immutable() const noexcept { return !is_mutable_; }
     explicit operator bool() const noexcept { return config_.is_valid(); }
 
     /**
@@ -2363,6 +2395,74 @@ class index_gt {
     }
 
     /**
+     *  @brief  The recommended way to initialize the index, as unlike the constructor,
+     *          it can fail with an error message, without raising an exception.
+     *
+     *  @param[in] config The configuration specs of the index.
+     *  @param[in] dynamic_allocator The allocator for temporary buffers and thread contexts, like priority queues.
+     *  @param[in] tape_allocator The allocator for the primary allocations of nodes and vectors.
+     */
+  template <typename metric_at, typename get_value_at, typename merge_callback_at = dummy_merge_callback_t>
+    static state_result_t merge( //
+        char const* file_path, std::vector<index_gt const*> const& indexes, metric_at&& metric,
+        get_value_at&& get_value,
+        index_config_t config = {}, dynamic_allocator_t dynamic_allocator = {}, tape_allocator_t tape_allocator = {},
+        index_update_config_t update_config = {}, merge_callback_at&& callback = merge_callback_at{}) noexcept {
+
+        state_result_t result = make(config, dynamic_allocator, tape_allocator);
+        if (result.error)
+            return result;
+
+        std::size_t n_members = 0;
+        std::size_t output_size = sizeof(index_serialized_header_t);
+        for (auto& index : indexes) {
+          n_members += index->size();
+          output_size += index->serialized_length();
+        }
+
+        index_serialized_header_t header;
+        header.size = 0;
+        header.connectivity = config.connectivity;
+        header.connectivity_base = config.connectivity_base;
+        header.max_level = -1;
+        header.entry_slot = 0;
+
+        {
+          std::ofstream output(file_path, std::ios::out | std::ios::binary);
+          output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+          output.close();
+          // Make this fie sparse if possible.
+          std::filesystem::resize_file(file_path, output_size);
+        }
+
+        memory_mapped_file_t file(file_path, /* is_writable = */ true);
+        serialization_result_t load_result = result.index.load(std::move(file));
+        if (!load_result) {
+          result.error = std::move(load_result.error);
+          result.index.reset();
+          return result;
+        }
+        index_limits_t limits;
+        limits.members = n_members;
+        if (!result.index.reserve(limits)) {
+          result.index.reset();
+          return result.failed("Out of memory");
+        }
+        for (auto& index : indexes) {
+          index_gt const& i = *index;
+          for (const auto& member : i) {
+            auto& value = get_value(i, member);
+            auto merge_callback = [&](member_ref_t m) {
+              callback(m, value);
+            };
+            result.index.add(get_key(member), value, metric, update_config, merge_callback);
+          }
+        }
+
+        return result;
+    }
+
+    /**
      *  @brief  The recommended way to copy the index, as unlike the copy-constructor,
      *          it can fail with an error message, without raising an exception.
      *
@@ -2441,7 +2541,8 @@ class index_gt {
         nodes_mutexes_ = {};
         limits_ = index_limits_t{0, 0};
         nodes_capacity_ = 0;
-        viewed_file_ = memory_mapped_file_t{};
+        mapped_file_ = memory_mapped_file_t{};
+        is_mutable_ = true;
         tape_allocator_ = {};
     }
 
@@ -2454,7 +2555,8 @@ class index_gt {
         std::swap(dynamic_allocator_, other.dynamic_allocator_);
         std::swap(tape_allocator_, other.tape_allocator_);
         std::swap(pre_, other.pre_);
-        std::swap(viewed_file_, other.viewed_file_);
+        std::swap(mapped_file_, other.mapped_file_);
+        std::swap(is_mutable_, other.is_mutable_);
         std::swap(max_level_, other.max_level_);
         std::swap(entry_slot_, other.entry_slot_);
         std::swap(nodes_, other.nodes_);
@@ -3163,7 +3265,7 @@ class index_gt {
      */
     std::size_t memory_usage(std::size_t allocator_entry_bytes = default_allocator_entry_bytes()) const noexcept {
         std::size_t total = 0;
-        if (!viewed_file_) {
+        if (!mapped_file_) {
             stats_t s = stats();
             total += s.allocated_bytes;
             total += s.nodes * allocator_entry_bytes;
@@ -3408,39 +3510,12 @@ class index_gt {
     }
 
     /**
-     *  @brief  Loads the serialized binary index representation from disk to RAM.
-     *          Adjusts the configuration properties of the constructed index to
-     *          match the settings in the file.
-     */
-    template <typename progress_at = dummy_progress_t>
-    serialization_result_t load(memory_mapped_file_t file, std::size_t offset = 0,
-                                progress_at&& progress = {}) noexcept {
-
-        serialization_result_t io_result = file.open_if_not();
-        if (!io_result)
-            return io_result;
-
-        serialization_result_t stream_result = load_from_stream(
-            [&](void* buffer, std::size_t length) {
-                if (offset + length > file.size())
-                    return false;
-                std::memcpy(buffer, file.data() + offset, length);
-                offset += length;
-                return true;
-            },
-            std::forward<progress_at>(progress));
-
-        return stream_result;
-    }
-
-    /**
      *  @brief  Memory-maps the serialized binary index representation from disk,
      *          @b without copying data into RAM, and fetching it on-demand.
      */
     template <typename progress_at = dummy_progress_t>
-    serialization_result_t view(memory_mapped_file_t file, std::size_t offset = 0,
+    serialization_result_t load_from_memory_mapped_file(memory_mapped_file_t file, std::size_t offset = 0,
                                 progress_at&& progress = {}) noexcept {
-
         // Remove previously stored objects
         index_limits_t old_limits = limits_;
         reset();
@@ -3454,7 +3529,8 @@ class index_gt {
         if (file.size() - offset < sizeof(header))
             return result.failed("File is corrupted and lacks a header");
         std::memcpy(&header, file.data() + offset, sizeof(header));
-
+        
+        mapped_file_ = std::move(file);
         if (!header.size) {
             reset();
             return result;
@@ -3504,8 +3580,53 @@ class index_gt {
             if (!progress(i + 1, header.size))
                 return result.failed("Terminated by user");
         }
-        viewed_file_ = std::move(file);
         return {};
+    }
+
+    /**
+     *  @brief  Loads the serialized binary index representation from disk to RAM.
+     *          If file is writable, this loads @b without copying
+     *          data into RAM, and fetching it on-demand like view() does.
+     *          Adjusts the configuration properties of the constructed index to
+     *          match the settings in the file.
+     */
+    template <typename progress_at = dummy_progress_t>
+    serialization_result_t load(memory_mapped_file_t file, std::size_t offset = 0,
+                                progress_at&& progress = {}) noexcept {
+
+        if (file.is_writable()) {
+          return load_from_memory_mapped_file(std::move(file), offset, std::forward<progress_at>(progress));
+        } else {
+          serialization_result_t io_result = file.open_if_not();
+          if (!io_result)
+            return io_result;
+
+          serialization_result_t stream_result = load_from_stream(
+            [&](void* buffer, std::size_t length) {
+              if (offset + length > file.size())
+                return false;
+              std::memcpy(buffer, file.data() + offset, length);
+              offset += length;
+              return true;
+            },
+            std::forward<progress_at>(progress));
+          return stream_result;
+        }
+    }
+
+    /**
+     *  @brief  Memory-maps the serialized binary index representation from disk,
+     *          @b without copying data into RAM, and fetching it on-demand.
+     */
+    template <typename progress_at = dummy_progress_t>
+    serialization_result_t view(memory_mapped_file_t file, std::size_t offset = 0,
+                                progress_at&& progress = {}) noexcept {
+      serialization_result_t load_result = load_from_memory_mapped_file(std::move(file), offset, std::forward<progress_at>(progress));
+      if (!load_result)
+        return load_result;
+
+      is_mutable_ = false;
+      return {};
     }
 
 #if defined(USEARCH_USE_PRAGMA_REGION)
@@ -3715,7 +3836,7 @@ class index_gt {
     }
 
     void node_free_(std::size_t idx) noexcept {
-        if (viewed_file_)
+        if (mapped_file_)
             return;
 
         node_t& node = nodes_[idx];
